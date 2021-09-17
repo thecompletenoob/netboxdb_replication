@@ -1,0 +1,95 @@
+---
+# Reference: https://stribny.name/blog/ansible-postgresql-backups/
+# Replicating Netbox production db to the netbox dev server
+
+- hosts: netbox_servers
+  gather_facts: no
+  become: yes
+
+  tasks:
+    - name: "Check for these packages on Ubuntu Servers and install"
+      # These packages need to be installed for Ansible to work well with the
+      #  Postgres db. Usually on the production instance, these are already
+      #  installed but if a lab is spun up it doesn't
+      apt: name={{ item }} state=latest update_cache=yes
+      with_items:
+        - acl
+        - python-psycopg2
+        - postgresql-contrib
+        - libpq-dev
+
+    - name: "Set timestamp of the backup"
+      set_fact:
+        #now: "{{ lookup('pipe', 'date +%F-%T') }}"
+        now: "{{ lookup('pipe', 'date +%Y-%m-%d_%H-%M') }}"
+        backup_file: "{{ db_name }}_{{ now }}.dump.gz"
+      delegate_to: localhost
+      run_once: yes
+
+    - name: Backup the db from the production server
+      block:
+        - name: "Back up the database"
+          postgresql_db:
+            state: dump
+            name: "{{ db_name }}"
+            target: "/tmp/{{ backup_file }}"
+          become: yes
+          become_user: postgres
+
+        - name: "Fetch backup from the prod server"
+          fetch:
+            src: "/tmp/{{ backup_file }}"
+            dest: "/tmp/{{ backup_file }}"
+            flat: yes
+      when: inventory_hostname == 'netbox_prod'
+
+    - name: Upload the db and restart netbox
+      block:
+        - name: Copy backup to dev server
+          copy:
+            src: "/tmp/{{ backup_file }}"
+            dest: "/tmp/{{ backup_file }}"
+
+        - name: Stop the netbox service
+          shell: |
+            systemctl stop netbox netbox-rq
+          become: yes
+
+        - name: "Delete the old database on the dev server"
+          postgresql_db:
+            state: absent
+            name: "{{ db_name }}"
+          become: yes
+          become_user: postgres
+
+        - name: "Create the new database on the dev server"
+          postgresql_db:
+            state: present
+            name: "{{ db_name }}"
+          become: yes
+          become_user: postgres
+
+        - name: "Restore the database to the dev server"
+          postgresql_db:
+            state: restore
+            name: "{{ db_name }}"
+            target: "/tmp/{{ backup_file }}"
+          become: yes
+          become_user: postgres
+
+        - name: Restart the netbox service and show status
+          shell: |
+            systemctl restart netbox netbox-rq
+            systemctl status netbox netbox-rq | grep -E "Active|service"
+          become: yes
+          register: shell_output
+      when: inventory_hostname == 'netbox_lab'
+
+    - name: Cleanup
+      shell: |
+        cd /tmp/
+        rm -r "{{ backup_file }}"
+      become: yes
+
+    - debug:
+        msg: "{{ shell_output.stdout_lines }}"
